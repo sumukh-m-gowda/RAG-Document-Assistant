@@ -63,7 +63,7 @@ def _write_active_collection(name):
 
 
 def load_existing_store():
-    """Load the most recently built Chroma collection from disk, if one exists."""
+    """ Load the most recently built Chroma collection from disk, if one exists. """
     collection_name = _read_active_collection()
     if collection_name and os.path.isdir(PERSIST_DIR):
         store = Chroma(
