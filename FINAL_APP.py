@@ -1,13 +1,9 @@
 """
-RAG Document Assistant — Streamlit App (Day 6 + Day 7)
+RAG Document Assistant — Streamlit App (Day 6 + Day 7, minimized)
 
-Consolidates the logic built across all 7 days of the RAG project:
-  Day 2 - Vector store (Chroma) + retrieval
-  Day 3 - Full RAG chain (retrieve -> prompt -> generate)
-  Day 4 - Score-threshold filtering + source citations
-  Day 5 - Conversational memory (question condensing)
-  Day 6 - Streamlit UI + SMTP upload notifications
-  Day 7 - Hybrid agent: optional email tool-calling (Day 1 pattern) inside RAG chat
+Pipeline: upload PDFs -> chunk -> embed -> Chroma -> condense question ->
+retrieve (filtered) -> answer from docs, or fall back to general knowledge ->
+optionally call the email tool if the user asked for one (hybrid agent).
 
 Run with:  streamlit run app.py
 """
@@ -37,33 +33,36 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_API_KEY2 = os.getenv("GEMINI_API_KEY2")
 
-
 DATA_DIR = "data"
 PERSIST_DIR = "chroma_db"
-# Chroma keeps its persisted files open while a client object is alive. On Windows,
-# trying to shutil.rmtree() that folder while a previous Chroma client still has it
-# open raises PermissionError: [WinError 32]. Rather than deleting anything, we give
-# every rebuild its own collection name (a "table" inside the same chroma_db folder)
-# and remember which one is current — no file deletion required.
+# Every rebuild gets its own Chroma collection name instead of deleting the old one —
+# avoids Windows file-lock errors from a previous client still holding the folder open.
 ACTIVE_COLLECTION_FILE = os.path.join(PERSIST_DIR, "active_collection.txt")
 DEFAULT_THRESHOLD = 0.8
+EMAIL_KEYWORDS = ("email", "mail", "send")
 
 st.set_page_config(page_title="RAG Document Assistant", page_icon="📄", layout="wide")
 
 
 @st.cache_resource(show_spinner=False)
 def get_embeddings_model():
-    # return GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001", google_api_key=GEMINI_API_KEY)
     return GoogleGenerativeAIEmbeddings(model="gemini-embedding-2", google_api_key=GEMINI_API_KEY2)
 
 
 @st.cache_resource(show_spinner=False)
 def get_llm():
-    # return ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=GEMINI_API_KEY)
     return ChatGoogleGenerativeAI(model="gemini-3.5-flash-lite", google_api_key=GEMINI_API_KEY2)
 
 
+@st.cache_resource(show_spinner=False)
+def get_llm_with_tools():
+    """Same model as get_llm(), with the email tool bound (Day 1's bind_tools pattern)."""
+    return get_llm().bind_tools([email_this])
 
+
+# ---------------------------------------------------------------------------
+# Collection tracking (which Chroma collection is "current")
+# ---------------------------------------------------------------------------
 def _read_active_collection():
     if os.path.isfile(ACTIVE_COLLECTION_FILE):
         with open(ACTIVE_COLLECTION_FILE, "r") as f:
@@ -80,29 +79,27 @@ def _write_active_collection(name):
 def load_existing_store():
     """Load the most recently built Chroma collection from disk, if one exists."""
     collection_name = _read_active_collection()
-    if collection_name and os.path.isdir(PERSIST_DIR):
-        store = Chroma(
-            persist_directory=PERSIST_DIR,
-            embedding_function=get_embeddings_model(),
-            collection_name=collection_name,
-        )
-        if store._collection.count() > 0:
-            return store
-    return None
+    if not (collection_name and os.path.isdir(PERSIST_DIR)):
+        return None
+    store = Chroma(
+        persist_directory=PERSIST_DIR,
+        embedding_function=get_embeddings_model(),
+        collection_name=collection_name,
+    )
+    return store if store._collection.count() > 0 else None
 
 
+# ---------------------------------------------------------------------------
+# Rate-limit-safe batched embedding
+# ---------------------------------------------------------------------------
 def _extract_retry_delay(error_message: str):
-    """Google's 429 errors often include 'Please retry in 43.4s' — reuse that hint if present."""
+    """Reuse Google's own 'Please retry in 43.4s' hint from a 429 error, if present."""
     match = re.search(r"retry in ([\d.]+)s", error_message, re.IGNORECASE)
-    if match:
-        return float(match.group(1)) + 1  # small buffer on top of the suggested delay
-    return None
+    return float(match.group(1)) + 1 if match else None
 
 
 def _add_batch_with_retry(store, batch, progress_callback=None, max_retries=2):
-    """Add one batch of chunks to the store, retrying with backoff on rate-limit (429) errors.
-    Capped at 2 retries with a max ~65s wait each — fails fast instead of silently blocking
-    for many minutes if the free-tier quota is still cooling down."""
+    """Retry a batch on 429 rate-limit errors (capped wait, fails fast otherwise)."""
     for attempt in range(max_retries):
         try:
             store.add_documents(batch)
@@ -114,22 +111,14 @@ def _add_batch_with_retry(store, batch, progress_callback=None, max_retries=2):
                 raise
             wait = min(_extract_retry_delay(msg) or 30, 65)
             if progress_callback:
-                progress_callback(f"Rate limit hit — waiting {wait:.0f}s before retrying (attempt {attempt + 1}/{max_retries})...")
+                progress_callback(f"Rate limit hit — waiting {wait:.0f}s (attempt {attempt + 1}/{max_retries})...")
             time.sleep(wait)
     raise RuntimeError("Failed to embed after retries due to API rate limits.")
 
 
 def build_vector_store_batched(chunks, collection_name, batch_size=50, pause_seconds=2, progress_callback=None):
-    """
-    Embed chunks in batches, pausing briefly between them. Using fewer, larger batches
-    (default 50 chunks/request) means small documents finish in a single request instead
-    of being split into many small ones that each risk tripping the per-minute rate limit.
-    """
-    store = Chroma(
-        persist_directory=PERSIST_DIR,
-        embedding_function=get_embeddings_model(),
-        collection_name=collection_name,
-    )
+    """Embed in batches (fewer, larger requests) with a pause between them."""
+    store = Chroma(persist_directory=PERSIST_DIR, embedding_function=get_embeddings_model(), collection_name=collection_name)
     total = len(chunks)
     for i in range(0, total, batch_size):
         batch = chunks[i:i + batch_size]
@@ -142,11 +131,9 @@ def build_vector_store_batched(chunks, collection_name, batch_size=50, pause_sec
 
 
 def build_store_from_uploads(uploaded_files, progress_callback=None):
-    """Save uploaded PDFs to disk, load + split + embed (batched) + persist a fresh Chroma collection.
-    Only processes the files uploaded in THIS call — old files left over in data/ from
-    previous sessions are ignored, so chunk counts stay accurate to what you just uploaded."""
+    """Save uploads -> load -> split -> embed (batched) -> persist a fresh collection.
+    Only processes files from THIS call, so old data/ leftovers don't get re-embedded."""
     os.makedirs(DATA_DIR, exist_ok=True)
-
     saved_paths = []
     for uf in uploaded_files:
         path = os.path.join(DATA_DIR, uf.name)
@@ -157,37 +144,26 @@ def build_store_from_uploads(uploaded_files, progress_callback=None):
     documents = []
     for path in saved_paths:
         documents.extend(PyPDFLoader(path).load())
-
     if not documents:
         return None, 0
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = splitter.split_documents(documents)
-
-    # Every rebuild gets its own collection name instead of deleting the old one —
-    # this sidesteps Windows file-lock errors entirely (see comment above load_existing_store).
+    chunks = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(documents)
     collection_name = f"docs_{int(time.time())}"
-
     store = build_vector_store_batched(chunks, collection_name, progress_callback=progress_callback)
     _write_active_collection(collection_name)
     return store, len(chunks)
 
 
 # ---------------------------------------------------------------------------
-# Email notification (reused from the Day 1 email agent project)
+# Email (SMTP) — plain function + LLM-callable tool wrapper
 # ---------------------------------------------------------------------------
 def send_email(recipient_email: str, subject: str, body: str) -> str:
-    """
-    Send an email to a given recipient email address with a given subject and body.
-    Uses Gmail SMTP to deliver the email. Returns success or error message.
-    """
+    """Send an email via Gmail SMTP. Returns a success or error message (never raises)."""
     sender_email = os.environ.get('SENDER_EMAIL')
     app_password = os.environ.get('SENDER_APP_PASSWORD')
     try:
         msg = MIMEMultipart()
-        msg['From'] = sender_email
-        msg['To'] = recipient_email
-        msg['Subject'] = subject
+        msg['From'], msg['To'], msg['Subject'] = sender_email, recipient_email, subject
         msg.attach(MIMEText(body, 'plain'))
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
             server.login(sender_email, app_password)
@@ -203,30 +179,18 @@ def send_email(recipient_email: str, subject: str, body: str) -> str:
 
 @tool
 def email_this(recipient_email: str, subject: str, message: str) -> str:
-    """
-    Send an email to the given recipient with the given subject and message.
-    Use this ONLY when the user explicitly asks to email, send, or mail something
-    to a specific address (e.g. "email this summary to alex@gmail.com"). Never use
-    this tool unless the user clearly asked for an email to be sent.
-    """
+    """Send an email to the given recipient with the given subject and message.
+    Use ONLY when the user explicitly asks to email/send/mail something to an address."""
     return send_email(recipient_email, subject, message)
 
 
-@st.cache_resource(show_spinner=False)
-def get_llm_with_tools():
-    """Same Gemini model as get_llm(), but with the email tool bound — this is the
-    Day 1 tool-calling pattern (bind_tools) applied inside the RAG app."""
-    return get_llm().bind_tools([email_this])
-
-
 # ---------------------------------------------------------------------------
-# RAG logic (Days 2-5, unchanged in behavior)
+# Prompts
 # ---------------------------------------------------------------------------
 CONDENSE_PROMPT = ChatPromptTemplate.from_template(
     """Given the conversation history and a follow-up question, rewrite the follow-up
 question to be a standalone question that includes all necessary context from the
-history. If the follow-up question is already standalone, return it unchanged.
-Do not answer the question - only rewrite it.
+history. If already standalone, return it unchanged. Do not answer it — only rewrite it.
 
 Conversation history:
 {chat_history}
@@ -237,16 +201,11 @@ Standalone question:"""
 )
 
 ANSWER_PROMPT = ChatPromptTemplate.from_template(
-    """You are a helpful assistant having an ongoing conversation, answering questions
-using ONLY the context provided below.
+    """You are a helpful assistant having an ongoing conversation, answering using ONLY the context below.
 
 Rules:
 - Base your answer strictly on the context. Do not use outside knowledge.
-- Reference the relevant [Source N] tag(s) inline when you use information from them.
-- If the context is exactly "NO_RELEVANT_CONTEXT", respond only with:
-  "I don't have relevant information in the provided documents to answer that."
-- You may refer naturally to earlier parts of the conversation, but never invent
-  facts that aren't in the context.
+- Reference the relevant [Source N] tag(s) inline when used.
 - Be concise and direct.
 
 Context:
@@ -258,26 +217,41 @@ Question:
 Answer:"""
 )
 
-FALLBACK_PROMPT = ChatPromptTemplate.from_template("""
-The user's question isn't covered by their uploaded documents.
-
-Answer it using your own general knowledge.
+FALLBACK_PROMPT = ChatPromptTemplate.from_template(
+    """The user's question isn't covered by their uploaded documents.
+Answer it using your own general knowledge, and be clear that this isn't from their documents.
 
 Question:
 {question}
 
-Answer:
-""")
+Answer:"""
+)
+
+HYBRID_INSTRUCTIONS = """You are a helpful assistant.
+
+Rules:
+- If the uploaded documents contain the answer, answer using ONLY the documents and cite [Source N].
+- If the documents do NOT contain the answer, answer using your own general knowledge.
+- The user has asked you to email something — use the email_this tool to do so.
+- Never call the email tool unless the user explicitly asked for an email.
+
+Context:
+{context}
+
+Question:
+{question}
+"""
 
 
+# ---------------------------------------------------------------------------
+# Core RAG logic
+# ---------------------------------------------------------------------------
 def format_history(chat_history):
     if not chat_history:
         return "(no previous conversation)"
-    lines = []
-    for msg in chat_history:
-        role = "User" if isinstance(msg, HumanMessage) else "Assistant"
-        lines.append(f"{role}: {msg.content}")
-    return "\n".join(lines)
+    return "\n".join(
+        f"{'User' if isinstance(m, HumanMessage) else 'Assistant'}: {m.content}" for m in chat_history
+    )
 
 
 def condense_question(question, chat_history, llm):
@@ -298,96 +272,54 @@ def format_docs_with_citations(filtered_results):
     context_parts, citation_map = [], {}
     for i, (doc, score) in enumerate(filtered_results, 1):
         tag = f"Source {i}"
-        source = doc.metadata.get("source", "unknown")
-        page = doc.metadata.get("page", "?")
-        citation_map[tag] = f"{os.path.basename(source)} (page {page})"
+        citation_map[tag] = f"{os.path.basename(doc.metadata.get('source', 'unknown'))} (page {doc.metadata.get('page', '?')})"
         context_parts.append(f"[{tag}]\n{doc.page_content}")
     return "\n\n".join(context_parts), citation_map
 
 
-HYBRID_INSTRUCTIONS = """
-You are a helpful assistant.
+def generate_grounded_answer(llm, context, question):
+    """Answer from the documents, or fall back to general knowledge if nothing relevant
+    was retrieved. This is the one place both agent_mode branches reuse — previously
+    duplicated in three places."""
+    if context == "NO_RELEVANT_CONTEXT":
+        chain = FALLBACK_PROMPT | llm | StrOutputParser()
+        return chain.invoke({"question": question})
+    chain = ANSWER_PROMPT | llm | StrOutputParser()
+    return chain.invoke({"context": context, "question": question})
 
-Rules:
-- If the uploaded documents contain the answer, answer using ONLY the documents.
-- If the uploaded documents do NOT contain the answer, answer using your own general knowledge.
-- If the user explicitly asks you to email the answer, use the email_this tool.
-- Never call the email tool unless the user explicitly asks.
-- If you use information from the documents, cite the relevant [Source N].
 
-Context:
-{context}
+def extract_text(content):
+    """Gemini tool-calling responses sometimes return content as a list of parts
+    instead of a plain string — normalize either shape into plain text."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(item.get("text", "") for item in content if isinstance(item, dict))
+    return str(content)
 
-Question:
-{question}
-"""
 
 def answer_question(store, llm, question, chat_history, threshold, agent_mode=False):
     standalone = condense_question(question, chat_history, llm)
     filtered = retrieve_filtered(store, standalone, threshold=threshold)
     context, citation_map = format_docs_with_citations(filtered)
 
-    if not agent_mode:
-        if context == "NO_RELEVANT_CONTEXT":
-            chain = FALLBACK_PROMPT | llm | StrOutputParser()
-            answer = chain.invoke({"question": standalone})
-        else:
-            chain = ANSWER_PROMPT | llm | StrOutputParser()
-            answer = chain.invoke(
-                {
-                    "context": context,
-                    "question": standalone,
-                }
-            )
+    wants_email = agent_mode and any(w in question.lower() for w in EMAIL_KEYWORDS)
 
+    if not wants_email:
+        answer = generate_grounded_answer(llm, context, standalone)
         return answer, citation_map, standalone
 
-    email_request = any(
-        word in question.lower()
-        for word in ["email", "mail", "send"]
-    )
-
-    if not email_request:
-        if context == "NO_RELEVANT_CONTEXT":
-            chain = FALLBACK_PROMPT | llm | StrOutputParser()
-            answer = chain.invoke({"question": standalone})
-        else:
-            chain = ANSWER_PROMPT | llm | StrOutputParser()
-            answer = chain.invoke(
-                {
-                    "context": context,
-                    "question": standalone,
-                }
-            )
-
-        return answer, citation_map, standalone
-    # --- Hybrid agent path (Day 7) ---
-    # Same shape as Day 1's run_agent(): send messages -> check tool_calls -> if
-    # present, execute the tool and feed the result back -> ask for a final answer.
+    # --- Hybrid agent path: same shape as Day 1's run_agent() ---
+    # send messages -> check tool_calls -> if present, execute + feed result back -> final answer.
     llm_tools = get_llm_with_tools()
-    prompt_text = HYBRID_INSTRUCTIONS.format(context=context, question=standalone)
-    messages = [HumanMessage(content=prompt_text)]
-
+    messages = [HumanMessage(content=HYBRID_INSTRUCTIONS.format(context=context, question=standalone))]
     response = llm_tools.invoke(messages)
     messages.append(response)
 
-    def extract_text(content):
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            return "".join(
-                item.get("text", "")
-                for item in content
-                if isinstance(item, dict)
-        )
-        return str(content)
-
     if response.tool_calls:
         for tool_call in response.tool_calls:
-            tool_result = email_this.invoke(tool_call)
-            messages.append(tool_result)
-        final = llm_tools.invoke(messages)
-        answer = extract_text(final.content)
+            messages.append(email_this.invoke(tool_call))
+        answer = extract_text(llm_tools.invoke(messages).content)
     else:
         answer = extract_text(response.content)
 
@@ -398,9 +330,9 @@ def answer_question(store, llm, question, chat_history, threshold, agent_mode=Fa
 # Streamlit UI
 # ---------------------------------------------------------------------------
 if "messages" not in st.session_state:
-    st.session_state.messages = []  # list of dicts: {role, content, sources}
+    st.session_state.messages = []
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []  # list of HumanMessage/AIMessage for condensing
+    st.session_state.chat_history = []
 if "store" not in st.session_state:
     st.session_state.store = load_existing_store()
 
@@ -411,7 +343,6 @@ with st.sidebar:
         st.error("GEMINI_API_KEY not found. Add it to your .env file.")
 
     uploaded_files = st.file_uploader("Upload PDF(s)", type=["pdf"], accept_multiple_files=True)
-
     notify_email = st.text_input(
         "Notify this email on upload",
         value=os.environ.get("SENDER_EMAIL", ""),
@@ -420,9 +351,7 @@ with st.sidebar:
 
     if st.button("Build / Rebuild Knowledge Base", disabled=not uploaded_files):
         status_box = st.empty()
-
-        def show_progress(msg):
-            status_box.info(msg)
+        show_progress = lambda msg: status_box.info(msg)
 
         store, n_chunks, build_failed = None, 0, False
         try:
@@ -431,17 +360,13 @@ with st.sidebar:
             build_failed = True
             status_box.empty()
             if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
-                st.error(
-                    "Gemini's free-tier embedding quota (100 requests/minute) was exceeded even "
-                    "after retrying. Wait a minute and try again, or upload fewer/smaller files."
-                )
+                st.error("Gemini's free-tier embedding quota (100/min) was exceeded even after retrying. Wait a minute and try again, or upload fewer/smaller files.")
             else:
                 st.error(f"Failed to build the knowledge base: {e}")
-
         status_box.empty()
 
         if build_failed:
-            pass  # error already shown above
+            pass
         elif store is None:
             st.error("No readable text found in the uploaded file(s).")
         else:
@@ -451,23 +376,17 @@ with st.sidebar:
             st.success(f"Indexed {n_chunks} chunk(s) from {len(uploaded_files)} file(s).")
 
             if notify_email:
-                file_names = ", ".join(f.name for f in uploaded_files)
-                subject = "Your RAG Knowledge Base Was Updated"
                 body = (
                     f"Your RAG Document Assistant just finished indexing new documents.\n\n"
-                    f"Files uploaded: {file_names}\n"
+                    f"Files uploaded: {', '.join(f.name for f in uploaded_files)}\n"
                     f"Chunks indexed: {n_chunks}\n\n"
                     f"You can now ask questions about these documents in the app."
                 )
                 with st.spinner(f"Sending notification email to {notify_email}..."):
-                    email_result = send_email(notify_email, subject, body)
-                if email_result.startswith("Email successfully sent"):
-                    st.success(email_result)
-                else:
-                    st.warning(email_result)
+                    result = send_email(notify_email, "Your RAG Knowledge Base Was Updated", body)
+                (st.success if result.startswith("Email successfully sent") else st.warning)(result)
 
     st.divider()
-
     threshold = st.slider(
         "Similarity threshold (lower = stricter)",
         min_value=0.3, max_value=1.5, value=DEFAULT_THRESHOLD, step=0.05,
@@ -484,9 +403,7 @@ with st.sidebar:
     agent_mode = st.checkbox(
         "🤖 Enable email tool (hybrid agent)",
         value=False,
-        help='Lets the model send an email when you explicitly ask, e.g. '
-             '"email this summary to alex@gmail.com". Uses the same tool-calling '
-             'pattern from the Day 1 email agent project.'
+        help='Lets the model send an email when you explicitly ask, e.g. "email this summary to alex@gmail.com".'
     )
 
     if st.session_state.store is not None:
@@ -515,9 +432,8 @@ else:
 
         with st.chat_message("assistant"):
             with st.spinner("Thinking..."):
-                llm = get_llm()
                 answer, citation_map, standalone = answer_question(
-                    st.session_state.store, llm, user_input,
+                    st.session_state.store, get_llm(), user_input,
                     st.session_state.chat_history, threshold, agent_mode
                 )
                 st.markdown(answer)
@@ -526,7 +442,7 @@ else:
                         for tag, label in citation_map.items():
                             st.markdown(f"**{tag}** — {label}")
                 if standalone != user_input:
-                    st.caption(f"(interpreted as: \"{standalone}\")")
+                    st.caption(f'(interpreted as: "{standalone}")')
 
         st.session_state.messages.append({"role": "assistant", "content": answer, "sources": citation_map})
         st.session_state.chat_history.append(HumanMessage(content=user_input))
